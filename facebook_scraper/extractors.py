@@ -8,11 +8,17 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 from tqdm.auto import tqdm
+from lxml import etree
+import dateparser
+import tzlocal
+import pytz
 
 from . import utils, exceptions
 from .constants import FB_BASE_URL, FB_MOBILE_BASE_URL, FB_W3_BASE_URL
 from .fb_types import Options, Post, RawPost, RequestFunction, Response, URL
-
+import os, sys
+sys.path.insert(1, os.path.join(sys.path[0], '..'))
+from settings import TIMEZONE
 
 try:
     from youtube_dl import YoutubeDL
@@ -336,7 +342,19 @@ class PostExtractor:
     def extract_time(self) -> PartialPost:
         # Try to extract time for timestamp
         page_insights = self.data_ft.get('page_insights', {})
-
+        try:
+            tree = etree.fromstring(self.full_post_html.html, etree.HTMLParser())
+            time_str = tree.xpath('//a[contains(@href, "permalink")]/abbr/text()')[0]
+            logger.debug(f"Extracted time string: {time_str}")
+            time = dateparser.parse(time_str)
+            if 'at' in time_str:
+                local_tz = tzlocal.get_localzone()
+                set_tz = pytz.timezone(TIMEZONE)
+                time = time.replace(tzinfo=set_tz)
+                time = time.astimezone(local_tz).replace(tzinfo=None)
+            return {'time': time, 'timestamp': time.timestamp()}
+        except Exception:
+            pass
         for page in page_insights.values():
             try:
                 timestamp = page['post_context']['publish_time']
@@ -421,7 +439,7 @@ class PostExtractor:
         link = self.link_regex.search(self.element.html)
         if link:
             link = utils.unquote(link.groups()[0])
-        links = self.element.find(".story_body_container>div a:not([href='#'])")
+        links = self.element.find(".story_body_container div p a")
         links = [{"link": a.attrs["href"], "text": a.text} for a in links]
         return {"link": link, "links": links}
 
@@ -464,8 +482,8 @@ class PostExtractor:
 
     # TODO: Remove `or 0` from this methods
     def extract_likes(self) -> PartialPost:
-        likes = (
-            utils.find_and_search(
+        return {
+            'likes': utils.find_and_search(
                 self.element, 'footer', self.likes_regex, utils.convert_numeric_abbr
             )
             or self.live_data.get("like_count")
@@ -478,10 +496,8 @@ class PostExtractor:
                 self.element.find(".like_def", first=True)
                 and utils.parse_int(self.element.find(".like_def", first=True).text)
             )
-            or 0
-        )
-
-        return {'likes': likes, 'reaction_count': likes}
+            or 0,
+        }
 
     def extract_comments(self) -> PartialPost:
         return {
@@ -508,11 +524,21 @@ class PostExtractor:
     def extract_photo_link_HQ(self, html: str) -> URL:
         # Find a link that says "View Full Size"
         match = self.image_regex.search(html)
+        if not match:
+            try:
+                tree = etree.fromstring(html, etree.HTMLParser())
+                match = tree.xpath('//link[@data-preloader="adp_CometPhotoRootContentQueryRelayPreloader_{N}_2"]/@href')[0]
+            except Exception:
+                pass
         if match:
-            url = match.groups()[0].replace("&amp;", "&")
+            try:
+                url = match.groups()[0].replace("&amp;", "&")
+            except Exception:
+                url = match
             if not url.startswith("http"):
                 url = utils.urljoin(FB_MOBILE_BASE_URL, url)
-            if url.startswith(utils.urljoin(FB_MOBILE_BASE_URL, "/photo/view_full_size/")):
+            # if url.startswith(utils.urljoin(FB_MOBILE_BASE_URL, "/photo/view_full_size/")):
+            if "/photo/view_full_size/" in url:
                 # Try resolve redirect
                 logger.debug(f"Fetching {url}")
                 try:
@@ -567,6 +593,45 @@ class PostExtractor:
                 results = list(results["query_results"].values())[0]["media"]
                 video_ids = []
                 videos = []
+                if results['count'] > 3:
+                    response = self.request(self.post['post_url'].replace('m.facebook.com', 'www.facebook.com'), desktop_user_agent=True)
+                    try:
+                        response.html.render(send_cookies_session=True)
+                    except Exception as e:
+                        print(e)
+                    links = response.html.find('a[href*="/photo/"]')
+                    if links[0].attrs['aria-label'] == 'Cover photo':
+                        image_link = links[1].attrs['href']
+                    else:
+                        image_link = links[0].attrs['href']
+                    image_response = self.request(image_link, desktop_user_agent=True)
+                    images.append(self.extract_photo_link_HQ(image_response.text))
+                    first_image_id = parse_qs(urlparse(image_link).query)['fbid']
+                    image_ids.append(first_image_id)
+                    search_str = '"nextMediaAfterNodeId":{"__typename":"Photo","id":"'
+                    next_image_id = ''
+                    try:
+                        found_index = image_response.text.find(search_str)
+                        if found_index == -1:
+                            raise ValueError('Next image id not found')
+                        border_left = found_index + len(search_str)
+                        border_right = image_response.text[border_left:].find('","') + border_left
+                        next_image_id = image_response.text[border_left:border_right]
+                    except Exception:
+                        pass
+                    while next_image_id and next_image_id != first_image_id:
+                        try:
+                            image_response = self.request(image_link.replace(first_image_id, next_image_id))
+                            images.append(self.extract_photo_link_HQ(image_response.text))
+                            image_ids.append(parse_qs(urlparse(image_link).query)['fbid'])
+                            found_index = image_response.text.find(search_str)
+                            if found_index == -1:
+                                raise ValueError('Next image id not found')
+                            border_left = found_index + len(search_str)
+                            border_right = image_response.text[border_left:].find('","') + border_left
+                            next_image_id = image_response.text[border_left:border_right]
+                        except Exception:
+                            break
                 for item in results["edges"]:
                     node = item["node"]
                     if node["is_playable"]:
@@ -574,7 +639,7 @@ class PostExtractor:
                         videos.append(node["playable_url_hd"] or node["playable_url"])
                         images.append(node["full_width_image"]["uri"])
                         image_ids.append(node["id"])
-                    else:
+                    elif results['count'] <= 3:  # otherwise images were extracted by alternative algorithm above
                         url = node["url"]
                         url = url.replace(FB_W3_BASE_URL, FB_MOBILE_BASE_URL)
                         logger.debug(f"Fetching {url}")
@@ -594,9 +659,10 @@ class PostExtractor:
                     "videos": videos,
                 }
             url = utils.urljoin(FB_MOBILE_BASE_URL, url)
+            url = url.replace('m.facebook.com', 'www.facebook.com')
             logger.debug(f"Fetching {url}")
             try:
-                response = self.request(url)
+                response = self.request(url, desktop_user_agent=True)
                 images.append(self.extract_photo_link_HQ(response.text))
                 elem = response.html.find(".img[data-sigil='photo-image']", first=True)
                 descriptions.append(elem.attrs.get("alt") or elem.attrs.get("aria-label"))
@@ -1106,56 +1172,34 @@ class PostExtractor:
         if not self.options.get("progress"):
             logger.debug(f"Fetching {replies_url}")
         try:
-            # Some users have to use an AJAX POST method to get replies.
-            # Check if this is the case by checking for the element that holds the encrypted response token
-            use_ajax_post = (
-                self.full_post_html.find("input[name='fb_dtsg']", first=True) is not None
+            fb_dtsg = self.full_post_html.find("input[name='fb_dtsg']", first=True).attrs["value"]
+            encryptedAjaxResponseToken = re.search(
+                r'encrypted":"([^"]+)', self.full_post_html.html
+            ).group(1)
+            response = self.request(
+                replies_url,
+                post=True,
+                params={"fb_dtsg": fb_dtsg, "__a": encryptedAjaxResponseToken},
             )
-
-            if use_ajax_post:
-                fb_dtsg = self.full_post_html.find("input[name='fb_dtsg']", first=True).attrs[
-                    "value"
-                ]
-                encryptedAjaxResponseToken = re.search(
-                    r'encrypted":"([^"]+)', self.full_post_html.html
-                ).group(1)
-                response = self.request(
-                    replies_url,
-                    post=True,
-                    params={"fb_dtsg": fb_dtsg, "__a": encryptedAjaxResponseToken},
-                )
-            else:
-                use_ajax_post = False
-                response = self.request(replies_url)
-
         except exceptions.TemporarilyBanned:
             raise
         except Exception as e:
             logger.error(e)
             return
+        prefix_length = len('for (;;);')
+        data = json.loads(response.text[prefix_length:])  # Strip 'for (;;);'
+        for action in data['payload']['actions']:
+            if action["cmd"] == "replace":
+                html = utils.make_html_element(
+                    action['html'],
+                    url=FB_MOBILE_BASE_URL,
+                )
+                break
 
-        if use_ajax_post:
-            prefix_length = len('for (;;);')
-            data = json.loads(response.text[prefix_length:])  # Strip 'for (;;);'
-            for action in data['payload']['actions']:
-                if action["cmd"] == "replace":
-                    html = utils.make_html_element(
-                        action['html'],
-                        url=FB_MOBILE_BASE_URL,
-                    )
-                    break
-
-            reply_selector = 'div[data-sigil="comment inline-reply"]'
-
-            if self.options.get("noscript"):
-                reply_selector = '#root div[id]'
-            replies = html.find(reply_selector)
-
-        else:
-            # Skip first element, as it will be this comment itself
-            reply_selector = 'div[data-sigil="comment"]'
-            replies = response.html.find(reply_selector)[1:]
-
+        reply_selector = 'div[data-sigil="comment inline-reply"]'
+        if self.options.get("noscript"):
+            reply_selector = '#root div[id]'
+        replies = html.find(reply_selector)
         try:
             for reply in replies:
                 yield self.parse_comment(reply)
@@ -1353,8 +1397,6 @@ class PostExtractor:
                 url = self.post.get('post_url').replace(FB_BASE_URL, FB_MOBILE_BASE_URL)
                 logger.debug(f"Fetching {url}")
                 response = self.request(url)
-            if response.text.startswith("for (;;)"):
-                logger.warning("full_post_html startswith for (;;)")
             self._full_post_html = response.html
             return self._full_post_html
         else:

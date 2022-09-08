@@ -32,7 +32,12 @@ def iter_hashtag_pages(hashtag: str, request_fn: RequestFunction, **kwargs) -> I
 def iter_pages(account: str, request_fn: RequestFunction, **kwargs) -> Iterator[Page]:
     start_url = kwargs.pop("start_url", None)
     if not start_url:
-        start_url = utils.urljoin(FB_MOBILE_BASE_URL, f'/{account}/')
+        start_url = utils.urljoin(FB_MOBILE_BASE_URL, f'/{account}/posts/')
+        try:
+            request_fn(start_url)
+        except Exception as ex:
+            logger.error(ex)
+            start_url = utils.urljoin(FB_MOBILE_BASE_URL, f'/{account}/')
     return generic_iter_pages(start_url, PageParser, request_fn, **kwargs)
 
 
@@ -143,7 +148,9 @@ class PageParser:
 
     def get_page(self) -> Page:
         # Select only elements that have the data-ft attribute
-        return self._get_page('article[data-ft*="top_level_post_id"]', 'article')
+        return self._get_page(
+            '[data-ft*="top_level_post_id"]:not([data-sigil="m-see-translate-link"])', 'article'
+        )
 
     def get_raw_page(self) -> RawPage:
         return self.html
@@ -199,16 +206,6 @@ class PageParser:
     def _get_page(self, selection, selection_name) -> Page:
         raw_page = self.get_raw_page()
         raw_posts = raw_page.find(selection)
-        for post in raw_posts:
-            if not post.find("footer"):
-                # Due to malformed HTML served by Facebook, lxml might misinterpret where the footer should go in article elements
-                # If we limit the parsing just to the section element, it fixes it
-                # Please forgive me for parsing HTML with regex
-                logger.warning(f"No footer in article - reparsing HTML within <section> element")
-                html = re.search(r'<section.+?>(.+)</section>', raw_page.html).group(1)
-                raw_page = utils.make_html_element(html=html)
-                raw_posts = raw_page.find(selection)
-                break
 
         if not raw_posts:
             logger.warning(
@@ -231,6 +228,8 @@ class GroupPageParser(PageParser):
     """Class for parsing a single page of a group"""
 
     cursor_regex_3 = re.compile(r'href[=:]"(\/groups\/[^"]+bac=[^"]+)"')  # for Group requests
+    cursor_regex_5 = re.compile(r'href[:=]"(/contextualprofile/postsstream/[^"]+)')  # for user's group posts first request
+    cursor_regex_6 = re.compile(r'href":"\\+(/contextualprofile\\+/postsstream\\+/[^"]+)\"')  # for user's group posts other requests
 
     def get_next_page(self) -> Optional[URL]:
         next_page = super().get_next_page()
@@ -244,10 +243,19 @@ class GroupPageParser(PageParser):
             value = match.groups()[0]
             return value.encode('utf-8').decode('unicode_escape').replace('\\/', '/')
 
+        match = self.cursor_regex_5.search(self.cursor_blob)
+        if match:
+            value = match.groups()[0]
+            return value.encode('utf-8').decode('unicode_escape').replace('\\/', '/')
+        match = self.cursor_regex_6.search(self.cursor_blob)
+        if match:
+            value = match.groups()[0]
+            return value.encode('utf-8').decode('unicode_escape').replace('\\/', '/')
+
         return None
 
-    def _parse(self):
-        self._parse_html()
+    # def _parse(self):
+    #     self._parse_html()
 
 
 class PhotosPageParser(PageParser):

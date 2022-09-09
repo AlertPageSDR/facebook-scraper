@@ -552,7 +552,16 @@ class PostExtractor:
                     logger.error(e)
             return url
         else:
-            return None
+            search_str = ',"image":{"uri":"'
+            found_index = html.find(search_str)
+            if found_index == -1:
+                return None
+            border_left = found_index + len(search_str)
+            border_right = html[border_left:].find('","') + border_left
+            url = html[border_left:border_right].replace('\\', '')
+            return url
+
+
 
     def extract_photo_link(self) -> PartialPost:
         if not self.options.get("allow_extra_requests", True) or not self.options.get(
@@ -593,24 +602,65 @@ class PostExtractor:
                 results = list(results["query_results"].values())[0]["media"]
                 video_ids = []
                 videos = []
-                if results['count'] > 3:
-                    response = self.request(self.post['post_url'].replace('m.facebook.com', 'www.facebook.com'), desktop_user_agent=True)
+                if results['count'] < 7:
+                    for item in results["edges"]:
+                        node = item["node"]
+                        if node["is_playable"]:
+                            video_ids.append(node["id"])
+                            videos.append(node["playable_url_hd"] or node["playable_url"])
+                            images.append(node["full_width_image"]["uri"])
+                            image_ids.append(node["id"])
+                        else:
+                            url = node["url"]
+                            url = url.replace(FB_W3_BASE_URL, FB_MOBILE_BASE_URL)
+                            logger.debug(f"Fetching {url}")
+                            response = self.request(url)
+                            images.append(self.extract_photo_link_HQ(response.text))
+                            image_ids.append(node["id"])
+                        descriptions.append(node["accessibility_caption"])
+                    return {
+                        "image": images[0] if images else None,
+                        "images": images,
+                        "images_description": descriptions,
+                        "image_id": image_ids[0] if image_ids else None,
+                        "image_ids": image_ids,
+                        "video": videos[0] if videos else None,
+                        "video_id": video_ids[0] if video_ids else None,
+                        "video_ids": video_ids,
+                        "videos": videos,
+                    }
+            try:
+                response = self.request(self.post['post_url'].replace('m.facebook.com', 'www.facebook.com'), desktop_user_agent=True)
+                try:
+                    response.html.render(send_cookies_session=True)
+                except Exception as e:
+                    print(e)
+                links = response.html.find('a[href*="/photo/"]')
+                if links[0].attrs['aria-label'] == 'Cover photo':
+                    image_link = links[1].attrs['href']
+                else:
+                    image_link = links[0].attrs['href']
+                image_response = self.request(image_link, desktop_user_agent=True)
+                images.append(self.extract_photo_link_HQ(image_response.text))
+                first_image_id = parse_qs(urlparse(image_link).query)['fbid'][0]
+                image_ids.append(first_image_id)
+                search_str = '"nextMediaAfterNodeId":{"__typename":"Photo","id":"'
+                next_image_id = ''
+                try:
+                    found_index = image_response.text.find(search_str)
+                    if found_index == -1:
+                        raise ValueError('Next image id not found')
+                    border_left = found_index + len(search_str)
+                    border_right = image_response.text[border_left:].find('","') + border_left
+                    next_image_id = image_response.text[border_left:border_right]
+                except Exception:
+                    pass
+                while next_image_id and next_image_id != first_image_id:
                     try:
-                        response.html.render(send_cookies_session=True)
-                    except Exception as e:
-                        print(e)
-                    links = response.html.find('a[href*="/photo/"]')
-                    if links[0].attrs['aria-label'] == 'Cover photo':
-                        image_link = links[1].attrs['href']
-                    else:
-                        image_link = links[0].attrs['href']
-                    image_response = self.request(image_link, desktop_user_agent=True)
-                    images.append(self.extract_photo_link_HQ(image_response.text))
-                    first_image_id = parse_qs(urlparse(image_link).query)['fbid']
-                    image_ids.append(first_image_id)
-                    search_str = '"nextMediaAfterNodeId":{"__typename":"Photo","id":"'
-                    next_image_id = ''
-                    try:
+                        image_response = self.request(image_link.replace(first_image_id, next_image_id),
+                                                      desktop_user_agent=True)
+                        images.append(self.extract_photo_link_HQ(image_response.text))
+                        image_ids.append(parse_qs(urlparse(image_link).query)['fbid'])
                         found_index = image_response.text.find(search_str)
                         if found_index == -1:
                             raise ValueError('Next image id not found')
@@ -618,46 +668,17 @@ class PostExtractor:
                         border_right = image_response.text[border_left:].find('","') + border_left
                         next_image_id = image_response.text[border_left:border_right]
                     except Exception:
-                        pass
-                    while next_image_id and next_image_id != first_image_id:
-                        try:
-                            image_response = self.request(image_link.replace(first_image_id, next_image_id))
-                            images.append(self.extract_photo_link_HQ(image_response.text))
-                            image_ids.append(parse_qs(urlparse(image_link).query)['fbid'])
-                            found_index = image_response.text.find(search_str)
-                            if found_index == -1:
-                                raise ValueError('Next image id not found')
-                            border_left = found_index + len(search_str)
-                            border_right = image_response.text[border_left:].find('","') + border_left
-                            next_image_id = image_response.text[border_left:border_right]
-                        except Exception:
-                            break
-                for item in results["edges"]:
-                    node = item["node"]
-                    if node["is_playable"]:
-                        video_ids.append(node["id"])
-                        videos.append(node["playable_url_hd"] or node["playable_url"])
-                        images.append(node["full_width_image"]["uri"])
-                        image_ids.append(node["id"])
-                    elif results['count'] <= 3:  # otherwise images were extracted by alternative algorithm above
-                        url = node["url"]
-                        url = url.replace(FB_W3_BASE_URL, FB_MOBILE_BASE_URL)
-                        logger.debug(f"Fetching {url}")
-                        response = self.request(url)
-                        images.append(self.extract_photo_link_HQ(response.text))
-                        image_ids.append(node["id"])
-                    descriptions.append(node["accessibility_caption"])
+                        break
                 return {
                     "image": images[0] if images else None,
                     "images": images,
                     "images_description": descriptions,
                     "image_id": image_ids[0] if image_ids else None,
                     "image_ids": image_ids,
-                    "video": videos[0] if videos else None,
-                    "video_id": video_ids[0] if video_ids else None,
-                    "video_ids": video_ids,
-                    "videos": videos,
                 }
+            except Exception as e:
+                pass
+
             url = utils.urljoin(FB_MOBILE_BASE_URL, url)
             url = url.replace('m.facebook.com', 'www.facebook.com')
             logger.debug(f"Fetching {url}")
@@ -665,8 +686,12 @@ class PostExtractor:
                 response = self.request(url, desktop_user_agent=True)
                 images.append(self.extract_photo_link_HQ(response.text))
                 elem = response.html.find(".img[data-sigil='photo-image']", first=True)
-                descriptions.append(elem.attrs.get("alt") or elem.attrs.get("aria-label"))
-                image_ids.append(re.search(r'[=/](\d+)', url).group(1))
+                if elem:
+                    descriptions.append(elem.attrs.get("alt") or elem.attrs.get("aria-label"))
+                    image_ids.append(re.search(r'[=/](\d+)', url).group(1))
+                else:
+                    descriptions.append(None)
+                    image_ids.append(None)
             except Exception as e:
                 logger.error(e)
                 total_photos_in_gallery -= 1
@@ -678,9 +703,7 @@ class PostExtractor:
             if response.html.find("a", containing="Photos from", first=True):
                 # Right arrow link
                 direction = '{"tn":"+="}'
-            url = response.html.find(f"a.touchable[data-gt='{direction}']", first=True).attrs[
-                "href"
-            ]
+            url = response.html.find(f"a.touchable[data-gt='{direction}']", first=True).attrs["href"]
             if not url.startswith("http"):
                 url = utils.urljoin(FB_MOBILE_BASE_URL, url)
             logger.debug(f"Fetching {url}")
